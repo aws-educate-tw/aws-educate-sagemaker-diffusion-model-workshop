@@ -55,6 +55,11 @@ Resources:
               - "*"
             ExposedHeaders:
               - ETag
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: s3:ObjectCreated:*
@@ -391,6 +396,67 @@ Resources:
                   except Exception as e:
                       print(f"Error notifying user: {e}")
 
+  ShareFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Share"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref GeneratedImagesBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import base64
+          import uuid
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  image_data = body.get('image_data') # Base64 string
+                  
+                  if not image_data:
+                      return {'statusCode': 400, 'body': 'Missing image_data'}
+
+                  if "base64," in image_data:
+                      image_data = image_data.split("base64,")[1]
+
+                  image_bytes = base64.b64decode(image_data)
+                  bucket_name = os.environ['BUCKET_NAME']
+                  
+                  file_name = f"shared/{str(uuid.uuid4())}.png"
+
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=file_name,
+                      Body=image_bytes,
+                      ContentType='image/png',
+                  )
+
+                  region = os.environ['AWS_REGION']
+                  url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{file_name}"
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                      },
+                      'body': json.dumps({'url': url})
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+
   # ==========================================================
   # 6. HTTP API
   # ==========================================================
@@ -430,6 +496,21 @@ Resources:
       IntegrationUri: !GetAtt GenerateFunction.Arn
       PayloadFormatVersion: "2.0"
 
+  ShareRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /share"
+      Target: !Join ["/", ["integrations", !Ref ShareIntegration]]
+
+  ShareIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ShareFunction.Arn
+      PayloadFormatVersion: "2.0"
+
   # ==========================================================
   # 7. Triggers & Permissions
   # ==========================================================
@@ -467,12 +548,25 @@ Resources:
     Properties:
       Bucket: !Ref GeneratedImagesBucket
       PolicyDocument:
+        Version: "2012-10-17"
         Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "${GeneratedImagesBucket.Arn}/*"
           - Effect: Allow
             Principal:
               Service: s3.amazonaws.com
             Action: s3:PutObject
             Resource: !Sub "${GeneratedImagesBucket.Arn}/*"
+
+  ShareLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ShareFunction
+      Principal: apigateway.amazonaws.com
 
 Outputs:
   WebSocketURI:
